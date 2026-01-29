@@ -371,7 +371,7 @@ def sample_random_requests(
 
     return input_requests
 
-
+#request schedule and request rate control
 async def get_request(
     input_requests: List[Tuple[str, int, int]],
     request_rate: float,
@@ -677,6 +677,18 @@ async def benchmark(
     print("{:<40} {:<10.2f}".format("Total Token throughput (tok/s):",
                                     metrics.total_token_throughput))
 
+    per_request = []
+    for i, output in enumerate(outputs):
+        per_request.append({
+            "success": output.success,
+            "ttft": output.ttft,
+            "latency": output.latency,
+            "inter_token_latencies": output.itl,
+            "prompt_len": output.prompt_len,
+            "output_len": actual_output_lens[i] if i < len(actual_output_lens) else 0,
+            "error": output.error,
+        })
+
     result = {
         "duration": benchmark_duration,
         "completed": metrics.completed,
@@ -687,6 +699,7 @@ async def benchmark(
         metrics.request_goodput if gootput_config_dict else None,
         "output_throughput": metrics.output_throughput,
         "total_token_throughput": metrics.total_token_throughput,
+        "requests": per_request,
         "input_lens": [output.prompt_len for output in outputs],
         "output_lens": actual_output_lens,
         "ttfts": [output.ttft for output in outputs],

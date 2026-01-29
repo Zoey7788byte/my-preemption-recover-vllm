@@ -205,3 +205,12 @@ benchmarks/*.json
 # Linting
 actionlint
 shellcheck*/
+
+# local artifacts
+logs/
+datasets/
+traces/
+*.log
+
+# local source backup
+vllm_src/
