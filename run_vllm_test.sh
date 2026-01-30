@@ -184,7 +184,7 @@ bash scripts/Sim_recovery_control_test_client.sh
 
 #组0和组1的差分是server侧的chunked prefill + 更小的max-num-batched-tokens
 
-#组2 切片恢复+ 恢复窗口 (server 不变，用组1)
+#组2 切片恢复+ 恢复窗口 (server 不变，用组1) addmission gate 是恢复窗口，让恢复不被饿死
 #client: 启用gate+slice检查
 RUN_TAG=$(date +%Y%m%d_%H%M%S) \
 GATE_ENABLE=1 GATE_GPU_PERC=0.92 GATE_PREEMPT_DELTA=1 GATE_T_S=2 \
@@ -193,3 +193,24 @@ LAMBDA_LOW=0.60 LAMBDA_HIGH=0.85 LOW_S=180 HIGH_S=180 NUM_CYCLES=8 \
 TRACE_PATH=/home/ad/zteng/vllm/traces/BurstGPT_without_fails_1.csv \
 START_TS=2032575.0 TRACE_WIN_S=300 MAX_TOTAL_TOKENS=14500 \
 bash scripts/Sim_recovery_control_test_client.sh
+
+
+
+
+#由于组2是分片的，现在组合分片
+python scripts/aggregate_recovery_slices.py \
+  --in /home/ad/zteng/vllm/logs/recovery_ctrl/20260130_103245_pmode=recompute_chunk=1_mbt=4096_mseq=16_ss=1_mem=0p75_maxlen=15000_swap=0_cvis=2_port=8000_gate1_gpu0p92_dpre1_t2_slice10/summary.csv
+
+
+#给Baseline\A1\A2的summary中增加吞吐列：
+python scripts/add_throughput_column.py \
+  /home/ad/zteng/vllm/logs/recovery_ctrl/20260129_163959_pmode=recompute_chunk=0_mbt=16384_mseq=16_ss=1_mem=0p75_maxlen=15000_swap=0_cvis=2_port=8000_gate0/summary.csv \
+  /home/ad/zteng/vllm/logs/recovery_ctrl/20260129_180558_pmode=recompute_chunk=1_mbt=4096_mseq=16_ss=1_mem=0p75_maxlen=15000_swap=0_cvis=2_port=8000_gate0/summary.csv \
+  /home/ad/zteng/vllm/logs/recovery_ctrl/20260130_103245_pmode=recompute_chunk=1_mbt=4096_mseq=16_ss=1_mem=0p75_maxlen=15000_swap=0_cvis=2_port=8000_gate1_gpu0p92_dpre1_t2_slice10/summary_agg.csv
+
+
+#现在开始画对比图
+python scripts/plot_recovery_compare.py \
+  --baseline /home/ad/zteng/vllm/logs/recovery_ctrl/20260129_163959_pmode=recompute_chunk=0_mbt=16384_mseq=16_ss=1_mem=0p75_maxlen=15000_swap=0_cvis=2_port=8000_gate0/summary.csv \
+  --a1 /home/ad/zteng/vllm/logs/recovery_ctrl/20260129_180558_pmode=recompute_chunk=1_mbt=4096_mseq=16_ss=1_mem=0p75_maxlen=15000_swap=0_cvis=2_port=8000_gate0/summary.csv \
+  --a2 /home/ad/zteng/vllm/logs/recovery_ctrl/20260130_103245_pmode=recompute_chunk=1_mbt=4096_mseq=16_ss=1_mem=0p75_maxlen=15000_swap=0_cvis=2_port=8000_gate1_gpu0p92_dpre1_t2_slice10/summary_agg.csv
