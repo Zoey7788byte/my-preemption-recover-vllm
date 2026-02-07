@@ -10,6 +10,7 @@ from vllm.core.block.prefix_caching_block import (ComputedBlocksTracker,
                                                   LastAccessBlocksTracker)
 from vllm.core.block.utils import check_no_caching_or_swa_for_blockmgr_encdec
 from vllm.core.interfaces import AllocStatus, BlockSpaceManager
+from vllm.recovery import add_swap_in, add_swap_out
 from vllm.sequence import Sequence, SequenceGroup, SequenceStatus
 from vllm.utils import Device
 
@@ -388,6 +389,9 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
                 for cpu_block_id, gpu_block_id in seq_swap_mapping.items()
             }
 
+            # Cycle-level observability counters: updated at swap execution
+            # point to avoid missing internal swap paths.
+            add_swap_in(len(seq_physical_block_id_mapping))
             physical_block_id_mapping.extend(
                 list(seq_physical_block_id_mapping.items()))
 
@@ -441,6 +445,9 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
                 for gpu_block_id, cpu_block_id in seq_swap_mapping.items()
             }
 
+            # Cycle-level observability counters: updated at swap execution
+            # point to avoid missing internal swap paths.
+            add_swap_out(len(seq_physical_block_id_mapping))
             physical_block_id_mapping.extend(
                 list(seq_physical_block_id_mapping.items()))
 

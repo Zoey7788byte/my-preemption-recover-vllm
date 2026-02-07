@@ -1,6 +1,7 @@
 """Sequence and its related classes."""
 import copy
 import enum
+import time
 from abc import ABC, abstractmethod
 from array import array
 from collections import defaultdict
@@ -120,6 +121,20 @@ class RequestMetrics:
     scheduler_time: Optional[float] = None
     model_forward_time: Optional[float] = None
     model_execute_time: Optional[float] = None
+
+
+@dataclass
+class RecoveryObsState:
+    # Phase0 placeholder for request-level recovery observability.
+    mode: str = "NORMAL"
+    mode_enter_ts_ns: int = field(default_factory=time.time_ns)
+    preempt_cnt: int = 0
+    last_restore_progress_ts_ns: int = 0
+    swapin_blocks_total: int = 0
+    swapout_blocks_total: int = 0
+    recompute_tokens_total: int = 0
+    restore_frontier: int = -1
+    swap_frontier: int = -1
 
 
 class SequenceDataDelta(
@@ -678,6 +693,7 @@ class SequenceGroup:
         self.priority = priority
 
         self.cached_request_output = None
+        self.recovery_obs = RecoveryObsState()
 
     @property
     def prompt(self) -> Optional[str]:

@@ -72,6 +72,13 @@ if TYPE_CHECKING:
     VLLM_ENABLE_V1_MULTIPROCESSING: bool = True
     VLLM_LOG_BATCHSIZE_INTERVAL: float = -1
     VLLM_DISABLE_COMPILE_CACHE: bool = False
+    VLLM_RECOVERY_OBS: bool = True
+    VLLM_RECOVERY_FLAGS_JSON: Optional[str] = None
+    VLLM_RECOVERY_LOG_DIR: str = "/tmp/vllm_recovery"
+    VLLM_RECOVERY_TS_PERIOD_MS: int = 50
+    VLLM_RECOVERY_V2: int = 0
+    VLLM_RECOVERY_BUDGET: int = 0
+    VLLM_RECOVERY_PHASE: int = 0
 
 
 def get_default_cache_root():
@@ -466,6 +473,24 @@ environment_variables: Dict[str, Callable[[], Any]] = {
     lambda: float(os.getenv("VLLM_LOG_BATCHSIZE_INTERVAL", "-1")),
     "VLLM_DISABLE_COMPILE_CACHE":
     lambda: bool(int(os.getenv("VLLM_DISABLE_COMPILE_CACHE", "0"))),
+
+    # Recovery control (Phase0: parse + observability only).
+    "VLLM_RECOVERY_OBS":
+    lambda:
+    (os.environ.get("VLLM_RECOVERY_OBS", "1").strip().lower() in ("1", "true",
+                                                                  "yes")),
+    "VLLM_RECOVERY_FLAGS_JSON":
+    lambda: os.getenv("VLLM_RECOVERY_FLAGS_JSON", None),
+    "VLLM_RECOVERY_LOG_DIR":
+    lambda: os.getenv("VLLM_RECOVERY_LOG_DIR", "/tmp/vllm_recovery"),
+    "VLLM_RECOVERY_TS_PERIOD_MS":
+    lambda: int(os.getenv("VLLM_RECOVERY_TS_PERIOD_MS", "50")),
+    "VLLM_RECOVERY_V2":
+    lambda: int(os.getenv("VLLM_RECOVERY_V2", "0")),
+    "VLLM_RECOVERY_BUDGET":
+    lambda: int(os.getenv("VLLM_RECOVERY_BUDGET", "0")),
+    "VLLM_RECOVERY_PHASE":
+    lambda: int(os.getenv("VLLM_RECOVERY_PHASE", "0")),
 }
 
 # end-env-vars-definition

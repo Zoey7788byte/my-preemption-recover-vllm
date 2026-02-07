@@ -13,6 +13,7 @@ from vllm.core.interfaces import AllocStatus, BlockSpaceManager
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
 from vllm.prompt_adapter.request import PromptAdapterRequest
+from vllm.recovery import RecoveryObservability
 from vllm.sequence import (Sequence, SequenceData, SequenceGroup,
                            SequenceGroupMetadata, SequenceGroupMetadataDelta,
                            SequenceStatus)
@@ -418,6 +419,7 @@ class Scheduler:
         # will be stopped during schedule() call and added to this stop list
         # for processing and deallocation by the free_finished_seq_groups()
         self._async_stopped: List[SequenceGroup] = []
+        self._recovery_obs = RecoveryObservability()
 
     @property
     def next_cache_id(self):
@@ -635,8 +637,11 @@ class Scheduler:
 
                 # Do preemption
                 if do_preempt:
-                    preempted_mode = self._preempt(victim_seq_group,
-                                                   blocks_to_swap_out)
+                    preempted_mode = self._preempt(
+                        victim_seq_group,
+                        blocks_to_swap_out,
+                        reason="low_free_blocks",
+                    )
                     if preempted_mode == PreemptionMode.RECOMPUTE:
                         preempted.append(victim_seq_group)
                     else:
@@ -875,7 +880,9 @@ class Scheduler:
                                          num_running_seqs)
 
                 #Preempt out the victim sequence group
-                self._preempt(vseq_group, blocks_to_swap_out)
+                self._preempt(vseq_group,
+                              blocks_to_swap_out,
+                              reason="priority_inversion")
                 waiting_queue.appendleft(vseq_group)
                 force_preemption_count += 1
             #Put the sequence back into the waiting queue
@@ -1287,6 +1294,7 @@ class Scheduler:
         # Schedule sequence groups.
         # This function call changes the internal states of the scheduler
         # such as self.running, self.swapped, and self.waiting.
+        self._recovery_obs.on_cycle_begin(time.time())
         scheduler_start_time = time.perf_counter()
 
         scheduler_outputs: SchedulerOutputs = self._schedule()
@@ -1431,6 +1439,14 @@ class Scheduler:
                 else:
                     seq_group.metrics.scheduler_time = scheduler_time
 
+        self._recovery_obs.on_cycle_end(
+            now_s=time.time(),
+            cycle_context=self._build_recovery_cycle_context(
+                scheduler_outputs=scheduler_outputs,
+                scheduler_wall_s=scheduler_time,
+            ),
+        )
+
         # Move to next cache (if exists)
         self.cache_id = self.next_cache_id
 
@@ -1527,8 +1543,12 @@ class Scheduler:
             if len(cows) > 0:
                 blocks_to_copy.extend(cows)
 
-    def _preempt(self, seq_group: SequenceGroup,
-                 blocks_to_swap_out: List[Tuple[int, int]]) -> PreemptionMode:
+    def _preempt(
+        self,
+        seq_group: SequenceGroup,
+        blocks_to_swap_out: List[Tuple[int, int]],
+        reason: str = "low_free_blocks",
+    ) -> PreemptionMode:
         # If preemption mode is not specified, we determine the mode as follows:
         # We use recomputation by default since it incurs lower overhead than
         # swapping. However, when the sequence group has multiple sequences
@@ -1560,6 +1580,25 @@ class Scheduler:
                 "total_num_cumulative_preemption=%d", seq_group.request_id,
                 preemption_mode, self.num_cumulative_preemption + 1)
         self.num_cumulative_preemption += 1
+        recovery_obs_state = getattr(seq_group, "recovery_obs", None)
+        if recovery_obs_state is not None:
+            recovery_obs_state.preempt_cnt += 1
+
+        self._recovery_obs.log_request_event(
+            "PREEMPT_TRIGGERED",
+            req_id=seq_group.request_id,
+            seq_id=(seq_group.get_seqs()[0].seq_id
+                    if len(seq_group.get_seqs()) > 0 else None),
+            reason=reason,
+            detail={
+                "preemption_mode": preemption_mode.name.lower(),
+                "queue_waiting_len": len(self.waiting),
+                "queue_running_len": len(self.running),
+                "queue_swapped_len": len(self.swapped),
+                "num_cumulative_preemption": self.num_cumulative_preemption,
+            },
+            block_manager=self.block_manager,
+        )
 
         if preemption_mode == PreemptionMode.RECOMPUTE:
             self._preempt_by_recompute(seq_group)
@@ -1592,7 +1631,28 @@ class Scheduler:
         seq_group: SequenceGroup,
         blocks_to_swap_in: List[Tuple[int, int]],
     ) -> None:
-        mapping = self.block_manager.swap_in(seq_group)
+        mapping = self.block_manager.swap_in(seq_group) or []
+        seqs = seq_group.get_seqs(status=SequenceStatus.SWAPPED)
+        seq_ids = [seq.seq_id for seq in seqs]
+        recovery_obs_state = getattr(seq_group, "recovery_obs", None)
+        if recovery_obs_state is not None:
+            recovery_obs_state.swapin_blocks_total += len(mapping)
+        self._recovery_obs.log_request_event(
+            "SWAP_IN",
+            req_id=seq_group.request_id,
+            seq_id=(seq_ids[0] if seq_ids else None),
+            reason="resume",
+            detail={
+                "blocks": len(mapping),
+                # Phase0 placeholder: block bytes are not directly exposed
+                # in scheduler path.
+                "bytes": 0,
+                "seq_ids": seq_ids,
+                "from": "cpu",
+                "to": "gpu",
+            },
+            block_manager=self.block_manager,
+        )
         blocks_to_swap_in.extend(mapping)
         for seq in seq_group.get_seqs(status=SequenceStatus.SWAPPED):
             seq.status = SequenceStatus.RUNNING
@@ -1608,10 +1668,99 @@ class Scheduler:
             raise RuntimeError(
                 "Aborted due to the lack of CPU swap space. Please increase "
                 "the swap space to avoid this error.")
-        mapping = self.block_manager.swap_out(seq_group)
+        mapping = self.block_manager.swap_out(seq_group) or []
+        seqs = seq_group.get_seqs(status=SequenceStatus.RUNNING)
+        seq_ids = [seq.seq_id for seq in seqs]
+        recovery_obs_state = getattr(seq_group, "recovery_obs", None)
+        if recovery_obs_state is not None:
+            recovery_obs_state.swapout_blocks_total += len(mapping)
+        self._recovery_obs.log_request_event(
+            "SWAP_OUT",
+            req_id=seq_group.request_id,
+            seq_id=(seq_ids[0] if seq_ids else None),
+            reason="low_free_blocks",
+            detail={
+                "blocks": len(mapping),
+                # Phase0 placeholder: block bytes are not directly exposed
+                # in scheduler path.
+                "bytes": 0,
+                "seq_ids": seq_ids,
+                "from": "gpu",
+                "to": "cpu",
+            },
+            block_manager=self.block_manager,
+        )
         blocks_to_swap_out.extend(mapping)
         for seq in seq_group.get_seqs(status=SequenceStatus.RUNNING):
             seq.status = SequenceStatus.SWAPPED
+
+    def _estimate_swap_frontier_avg(self) -> float:
+        if not self.swapped:
+            return 0.0
+        frontiers: List[int] = []
+        for seq_group in self.swapped:
+            seqs = seq_group.get_seqs(status=SequenceStatus.SWAPPED)
+            if not seqs:
+                seqs = seq_group.get_seqs()
+            for seq in seqs:
+                frontiers.append(seq.data.get_num_computed_tokens())
+        if not frontiers:
+            return 0.0
+        return round(sum(frontiers) / len(frontiers), 3)
+
+    def _build_recovery_cycle_context(
+        self,
+        *,
+        scheduler_outputs: SchedulerOutputs,
+        scheduler_wall_s: float,
+    ) -> Dict[str, Union[int, float]]:
+        prefill_tokens = 0
+        decode_tokens = 0
+        for scheduled in scheduler_outputs.scheduled_seq_groups:
+            if scheduled.seq_group.is_prefill():
+                prefill_tokens += scheduled.token_chunk_size
+            else:
+                decode_tokens += scheduled.token_chunk_size
+
+        token_budget = max(1, self.scheduler_config.max_num_batched_tokens)
+        seq_budget = max(1, self.scheduler_config.max_num_seqs)
+        online_load_tokens = min(1.0, scheduler_outputs.num_batched_tokens /
+                                 token_budget)
+        online_load_seqs = min(1.0, scheduler_outputs.running_queue_size /
+                               seq_budget)
+        online_load_est = max(online_load_tokens, online_load_seqs)
+        gpu_kv_blocks_free = 0
+        try:
+            gpu_kv_blocks_free = int(self.block_manager.get_num_free_gpu_blocks())
+        except Exception:
+            gpu_kv_blocks_free = 0
+        t_on_ms = round(max(0.0, scheduler_wall_s) * 1000.0, 3)
+
+        return {
+            "cycle_wall_ms": t_on_ms,
+            "prefill_tokens": prefill_tokens,
+            "decode_tokens": decode_tokens,
+            "num_batched_tokens": scheduler_outputs.num_batched_tokens,
+            "running_queue_size": scheduler_outputs.running_queue_size,
+            "waiting_len": len(self.waiting),
+            "on_waiting_len": len(self.waiting),
+            "running_len": len(self.running),
+            "swapped_len": len(self.swapped),
+            "preempted": scheduler_outputs.preempted,
+            "on_preempt_count_delta": scheduler_outputs.preempted,
+            "swap_frontier_avg": self._estimate_swap_frontier_avg(),
+            "T_on_ms": t_on_ms,
+            "recovery_overhead_ms": 0.0,
+            "recompute_tokens": 0,
+            "gpu_kv_blocks_free": gpu_kv_blocks_free,
+            "online_load_est": round(online_load_est, 6),
+            "online_load_tokens": round(online_load_tokens, 6),
+            "online_load_seqs": round(online_load_seqs, 6),
+            "slack_tokens": max(0,
+                                token_budget - scheduler_outputs.num_batched_tokens),
+            "slack_seqs": max(
+                0, seq_budget - scheduler_outputs.running_queue_size),
+        }
 
     def _passed_delay(self, now: float) -> bool:
         if self.prev_prompt:
