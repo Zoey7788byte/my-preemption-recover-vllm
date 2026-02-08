@@ -32,8 +32,8 @@ MAXLEN="${MAXLEN:-15000}"
 MAX_BATCH_TOKENS="${MAX_BATCH_TOKENS:-16384}"
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-16}"
 
-PMODE="${PMODE:-recompute}"
-SWAP_SPACE_GB="${SWAP_SPACE_GB:-0}"
+PMODE="${PMODE:-swap}"
+SWAP_SPACE_GB="${SWAP_SPACE_GB:-32}"
 
 ENABLE_CHUNKED_PREFILL="${ENABLE_CHUNKED_PREFILL:-0}"   # 0/1/true/false/yes/no
 NUM_SCHED_STEPS="${NUM_SCHED_STEPS:-1}"                 # integer >= 1
@@ -68,6 +68,13 @@ fi
 if awk "BEGIN{exit !(${MEM} < 0.70)}"; then
   echo "[WARN] MEM=${MEM} < 0.70 is not allowed on this machine. Auto bump to 0.70"
   MEM="0.70"
+fi
+
+if [[ "${PMODE}" == "swap" ]]; then
+  if awk "BEGIN{exit !(${SWAP_SPACE_GB} <= 0)}"; then
+    echo "[ERROR] PMODE=swap requires SWAP_SPACE_GB > 0."
+    exit 1
+  fi
 fi
 
 # IMPORTANT:

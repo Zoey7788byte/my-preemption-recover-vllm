@@ -173,6 +173,7 @@ PMODE=recompute SWAP_SPACE_GB=0 ENABLE_CHUNKED_PREFILL=1 NUM_SCHED_STEPS=1 \
 CFG_TAG=rc_chunked_bt4096 \
 bash scripts/Sim_recovery_control_test_server.sh
 
+
 #client: gate仍关闭
 RUN_TAG=$(date +%Y%m%d_%H%M%S) \
 GATE_ENABLE=0 PHASE_SLICE_S=0 \
@@ -195,8 +196,6 @@ START_TS=2032575.0 TRACE_WIN_S=300 MAX_TOTAL_TOKENS=14500 \
 bash scripts/Sim_recovery_control_test_client.sh
 
 
-
-
 #由于组2是分片的，现在组合分片
 python scripts/aggregate_recovery_slices.py \
   --in /home/ad/zteng/vllm/logs/recovery_ctrl/20260130_103245_pmode=recompute_chunk=1_mbt=4096_mseq=16_ss=1_mem=0p75_maxlen=15000_swap=0_cvis=2_port=8000_gate1_gpu0p92_dpre1_t2_slice10/summary.csv
@@ -214,3 +213,4 @@ python scripts/plot_recovery_compare.py \
   --baseline /home/ad/zteng/vllm/logs/recovery_ctrl/20260129_163959_pmode=recompute_chunk=0_mbt=16384_mseq=16_ss=1_mem=0p75_maxlen=15000_swap=0_cvis=2_port=8000_gate0/summary.csv \
   --a1 /home/ad/zteng/vllm/logs/recovery_ctrl/20260129_180558_pmode=recompute_chunk=1_mbt=4096_mseq=16_ss=1_mem=0p75_maxlen=15000_swap=0_cvis=2_port=8000_gate0/summary.csv \
   --a2 /home/ad/zteng/vllm/logs/recovery_ctrl/20260130_103245_pmode=recompute_chunk=1_mbt=4096_mseq=16_ss=1_mem=0p75_maxlen=15000_swap=0_cvis=2_port=8000_gate1_gpu0p92_dpre1_t2_slice10/summary_agg.csv
+

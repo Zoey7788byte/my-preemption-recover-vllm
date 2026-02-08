@@ -20,7 +20,7 @@ cd /data/home/ad/zteng/vllm
 CUDA_VISIBLE_DEVICES=2 \
 VLLM_RECOVERY_OBS=0 \
 MEM=0.75 MAXLEN=15000 MAX_BATCH_TOKENS=16384 MAX_NUM_SEQS=16 \
-PMODE=recompute SWAP_SPACE_GB=0 ENABLE_CHUNKED_PREFILL=0 NUM_SCHED_STEPS=1 \
+PMODE=swap SWAP_SPACE_GB=8 ENABLE_CHUNKED_PREFILL=0 NUM_SCHED_STEPS=1 \
 CFG_TAG=phase0_baseline_simrc_ref \
 bash scripts/phase0_recovery_server.sh
 
@@ -37,25 +37,24 @@ bash scripts/phase0_recovery_client.sh
 
 
 
-
-
 #22222=======
 #1) 启动 server（M2 micro swap-in）
 CUDA_VISIBLE_DEVICES=2 \
-MEM=0.75 MAXLEN=15000 MAX_BATCH_TOKENS=4096 MAX_NUM_SEQS=16 \
-PMODE=recompute SWAP_SPACE_GB=0 ENABLE_CHUNKED_PREFILL=1 NUM_SCHED_STEPS=1 \
-VLLM_RECOVERY_BUDGET=16 VLLM_RECOVERY_PHASE=1 \
-CFG_TAG=phase1_m2_budget16 \
+VLLM_RECOVERY_OBS=1 VLLM_RECOVERY_PHASE=1 VLLM_RECOVERY_BUDGET=16 \
+MEM=0.75 MAXLEN=15000 MAX_BATCH_TOKENS=16384 MAX_NUM_SEQS=16 \
+PMODE=swap SWAP_SPACE_GB=8 ENABLE_CHUNKED_PREFILL=1 NUM_SCHED_STEPS=1 \
+CFG_TAG=phase1_m2_budget16_swap \
 bash scripts/phase1_recovery_server.sh
 
+
+
 #2）client
-RUN_TAG=$(date +%Y%m%d_%H%M%S) \
+GATE_ENABLE=0 PHASE_SLICE_S=0 \
 LAMBDA_LOW=0.60 LAMBDA_HIGH=0.85 LOW_S=180 HIGH_S=180 NUM_CYCLES=8 \
 TRACE_PATH=/home/ad/zteng/vllm/traces/BurstGPT_without_fails_1.csv \
 START_TS=2032575.0 TRACE_WIN_S=300 MAX_TOTAL_TOKENS=14500 \
 bash scripts/phase1_recovery_client.sh
 
 
-
-#恢复备份
-git apply logs/RecoveryGen/backups/phase1_save_20260207_121830/phase1_only.diff
+#phase0 和phase1两阶段效果分析
+python3 scripts/analyze_phase0_phase1_effectiveness.py --json-out /home/ad/zteng/vllm/logs/RecoveryGen/Phase1/phase_eval.json

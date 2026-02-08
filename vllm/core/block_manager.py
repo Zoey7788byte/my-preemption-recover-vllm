@@ -10,8 +10,10 @@ from vllm.core.block.prefix_caching_block import (ComputedBlocksTracker,
                                                   LastAccessBlocksTracker)
 from vllm.core.block.utils import check_no_caching_or_swa_for_blockmgr_encdec
 from vllm.core.interfaces import AllocStatus, BlockSpaceManager
-from vllm.recovery import add_swap_in, add_swap_out
-from vllm.sequence import Sequence, SequenceGroup, SequenceStatus
+from vllm.recovery.observability import (add_restore_commit, add_swap_in,
+                                         add_swap_out, log_recovery_event)
+from vllm.sequence import (RecoveryMode, RecoveryStorageHint, Sequence,
+                           SequenceGroup, SequenceStatus)
 from vllm.utils import Device
 
 SeqId = int
@@ -174,6 +176,15 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
         seq = waiting_seqs[0]
         block_table: BlockTable = self._allocate_sequence(seq)
         self.block_tables[seq.seq_id] = block_table
+        try:
+            seq.ensure_recovery_blocks()
+            seq.recovery_state.mark_all(RecoveryStorageHint.GPU_RESIDENT)
+            num_blocks = seq.recovery_state.num_blocks()
+            if num_blocks > 0:
+                seq.recovery_state.commit_restored_range(0, num_blocks)
+                seq.recovery_state.swap_frontier = num_blocks
+        except Exception:
+            pass
 
         # Track seq
         self._last_access_blocks_tracker.add_seq(seq.seq_id)
@@ -184,6 +195,15 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
 
             # Track seq
             self._last_access_blocks_tracker.add_seq(seq.seq_id)
+            try:
+                seq.ensure_recovery_blocks()
+                seq.recovery_state.mark_all(RecoveryStorageHint.GPU_RESIDENT)
+                num_blocks = seq.recovery_state.num_blocks()
+                if num_blocks > 0:
+                    seq.recovery_state.commit_restored_range(0, num_blocks)
+                    seq.recovery_state.swap_frontier = num_blocks
+            except Exception:
+                pass
 
         # Allocate cross-attention block table for encoder sequence
         #
@@ -239,6 +259,13 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
     ) -> List[Tuple[int, int]]:
 
         block_table = self.block_tables[seq.seq_id]
+        prev_num_blocks = len(block_table.blocks)
+        null_block = None
+        if self.max_block_sliding_window is not None:
+            try:
+                null_block = self.block_allocator.allocate_or_get_null_block()
+            except Exception:
+                null_block = None
 
         block_table.append_token_ids(
             token_ids=block_table.get_unseen_token_ids(seq.get_token_ids()),
@@ -246,6 +273,40 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
             num_computed_slots=seq.data.get_num_computed_tokens(),
             extra_hash=seq.extra_hash(),
         )
+        try:
+            new_num_blocks = len(block_table.blocks)
+            seq.ensure_recovery_blocks()
+            if null_block is not None:
+                dropped_blocks = 0
+                for blk in block_table.blocks:
+                    if blk is null_block:
+                        dropped_blocks += 1
+                    else:
+                        break
+                if dropped_blocks > 0:
+                    seq.recovery_state.mark_range(
+                        0,
+                        dropped_blocks,
+                        RecoveryStorageHint.MISSING_RECOMPUTE,
+                    )
+                    seq.recovery_state.swap_frontier = 0
+                    for i in range(
+                            min(dropped_blocks,
+                                len(seq.recovery_state.restored_map))):
+                        seq.recovery_state.restored_map[i] = False
+                    seq.recovery_state.note_progress()
+            if new_num_blocks > prev_num_blocks:
+                seq.recovery_state.mark_range(
+                    prev_num_blocks,
+                    new_num_blocks,
+                    RecoveryStorageHint.GPU_RESIDENT,
+                )
+                seq.recovery_state.swap_frontier = max(
+                    seq.recovery_state.swap_frontier, new_num_blocks)
+                seq.recovery_state.commit_restored_range(
+                    prev_num_blocks, new_num_blocks)
+        except Exception:
+            pass
         # Return any new copy-on-writes.
         new_cows = self.block_allocator.clear_copy_on_writes()
         return new_cows
@@ -341,8 +402,10 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
         # Track child seq
         self._last_access_blocks_tracker.add_seq(child_seq.seq_id)
 
-    def can_swap_in(self, seq_group: SequenceGroup,
-                    num_lookahead_slots: int) -> AllocStatus:
+    def can_swap_in(self,
+                    seq_group: SequenceGroup,
+                    num_lookahead_slots: int,
+                    k_swap_max: Optional[int] = None) -> AllocStatus:
         """Returns the AllocStatus for the given sequence_group 
         with num_lookahead_slots.
 
@@ -354,10 +417,34 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
         Returns:
             AllocStatus: The AllocStatus for the given sequence group.
         """
+        if k_swap_max is not None:
+            host_blocks = 0
+            for seq in seq_group.get_seqs(status=SequenceStatus.SWAPPED):
+                try:
+                    host_blocks += sum(
+                        1 for hint in seq.recovery_state.storage_hint.values()
+                        if hint == RecoveryStorageHint.HOST_STORED)
+                except Exception:
+                    host_blocks += len(self.block_tables[seq.seq_id].blocks)
+            num_blocks_touched = min(k_swap_max, host_blocks)
+            if num_blocks_touched <= 0:
+                return AllocStatus.OK
+            if self.block_allocator.get_num_total_blocks(
+                    Device.GPU) < num_blocks_touched:
+                return AllocStatus.NEVER
+            elif self.block_allocator.get_num_free_blocks(
+                    Device.GPU) - num_blocks_touched >= self.watermark_blocks:
+                return AllocStatus.OK
+            else:
+                return AllocStatus.LATER
         return self._can_swap(seq_group, Device.GPU, SequenceStatus.SWAPPED,
                               num_lookahead_slots)
 
-    def swap_in(self, seq_group: SequenceGroup) -> List[Tuple[int, int]]:
+    def swap_in(
+        self,
+        seq_group: SequenceGroup,
+        k_swap_max: Optional[int] = None,
+    ) -> Tuple[List[Tuple[int, int]], int]:
         """Returns the block id mapping (from CPU to GPU) generated by
         swapping in the given seq_group with num_lookahead_slots.
 
@@ -368,15 +455,57 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
             List[Tuple[int, int]]: The mapping of swapping block from CPU 
                 to GPU.
         """
-        physical_block_id_mapping = []
+        physical_block_id_mapping: List[Tuple[int, int]] = []
+        total_done = 0
+        k_remaining = k_swap_max if k_swap_max is not None else None
         for seq in seq_group.get_seqs(status=SequenceStatus.SWAPPED):
             blocks = self.block_tables[seq.seq_id].blocks
             if len(blocks) == 0:
                 continue
-
-            seq_swap_mapping = self.block_allocator.swap(blocks=blocks,
-                                                         src_device=Device.CPU,
-                                                         dst_device=Device.GPU)
+            max_to_swap = k_remaining
+            if max_to_swap is None:
+                max_to_swap = len(blocks)
+            max_to_swap = min(max_to_swap,
+                              self.block_allocator.get_num_free_blocks(
+                                  Device.GPU))
+            if max_to_swap <= 0:
+                continue
+            indices: List[int] = []
+            skipped_already_restored = 0
+            try:
+                start = max(0, seq.recovery_state.swap_frontier)
+                for idx in range(start, len(blocks)):
+                    if len(indices) >= max_to_swap:
+                        break
+                    if seq.recovery_state.storage_hint.get(
+                            idx) == RecoveryStorageHint.HOST_STORED:
+                        if (idx < len(seq.recovery_state.restored_map)
+                                and seq.recovery_state.restored_map[idx]):
+                            skipped_already_restored += 1
+                            continue
+                        indices.append(idx)
+                if not indices and seq.recovery_state.storage_hint:
+                    for idx in range(0, len(blocks)):
+                        if len(indices) >= max_to_swap:
+                            break
+                        if seq.recovery_state.storage_hint.get(
+                                idx) == RecoveryStorageHint.HOST_STORED:
+                            if (idx < len(seq.recovery_state.restored_map)
+                                    and seq.recovery_state.restored_map[idx]):
+                                skipped_already_restored += 1
+                                continue
+                            indices.append(idx)
+            except Exception:
+                indices = list(range(0, min(len(blocks), max_to_swap)))
+            if not indices:
+                continue
+            blocks_to_swap = [blocks[idx] for idx in indices]
+            k_req = len(blocks_to_swap)
+            seq_swap_mapping = self.block_allocator.swap(
+                blocks=blocks_to_swap,
+                src_device=Device.CPU,
+                dst_device=Device.GPU,
+            )
 
             # Refresh the block ids of the table (post-swap)
             self.block_tables[seq.seq_id].update(blocks)
@@ -389,13 +518,104 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
                 for cpu_block_id, gpu_block_id in seq_swap_mapping.items()
             }
 
-            # Cycle-level observability counters: updated at swap execution
-            # point to avoid missing internal swap paths.
-            add_swap_in(len(seq_physical_block_id_mapping))
             physical_block_id_mapping.extend(
                 list(seq_physical_block_id_mapping.items()))
+            total_done += len(seq_swap_mapping)
+            if k_remaining is not None:
+                k_remaining -= len(seq_swap_mapping)
+            try:
+                seq.recovery_obs.swapin_blocks_total += len(seq_swap_mapping)
+            except Exception:
+                pass
+            try:
+                seq.ensure_recovery_blocks()
+                seq.recovery_state.recovery_enabled = True
+                seq.recovery_state.mode = RecoveryMode.RECOVERY
+                for idx in indices:
+                    seq.recovery_state.storage_hint[
+                        idx] = RecoveryStorageHint.GPU_RESIDENT
+                commit_start, commit_end, new_frontier = (
+                    seq.recovery_state.commit_progress(
+                        "swap",
+                        min(indices),
+                        max(indices) + 1,
+                    ))
+                seq.recovery_state.swapin_blocks_total += len(seq_swap_mapping)
+            except Exception:
+                pass
+            try:
+                add_restore_commit(len(seq_swap_mapping))
+                log_recovery_event(
+                    "RECOVERY_PROGRESS_COMMIT",
+                    req_id=seq_group.request_id,
+                    seq_id=seq.seq_id,
+                    detail={
+                        "kind": "swap",
+                        "blocks_committed": len(seq_swap_mapping),
+                        "range": [commit_start, commit_end],
+                        "new_frontier": new_frontier,
+                    },
+                    block_manager=self,
+                )
+            except Exception:
+                pass
+            try:
+                log_recovery_event(
+                    "SWAP_IN_MICRO",
+                    req_id=seq_group.request_id,
+                    seq_id=seq.seq_id,
+                    detail={
+                        "k_req": k_req,
+                        "k_done": len(seq_swap_mapping),
+                    },
+                    block_manager=self,
+                )
+            except Exception:
+                pass
+            if skipped_already_restored > 0:
+                try:
+                    log_recovery_event(
+                        "SWAP_IN_SKIP_ALREADY_RESTORED",
+                        req_id=seq_group.request_id,
+                        seq_id=seq.seq_id,
+                        detail={
+                            "count": skipped_already_restored,
+                        },
+                        block_manager=self,
+                    )
+                except Exception:
+                    pass
+            try:
+                log_recovery_event(
+                    "RECOVERY_REMAINING_HOST_BLOCKS",
+                    req_id=seq_group.request_id,
+                    seq_id=seq.seq_id,
+                    detail={
+                        "n_host": seq.recovery_state.count_hints()[1],
+                    },
+                    block_manager=self,
+                )
+            except Exception:
+                pass
+            try:
+                log_recovery_event(
+                    "SWAP_IN",
+                    req_id=seq_group.request_id,
+                    seq_id=seq.seq_id,
+                    detail={
+                        "blocks_count": len(seq_swap_mapping),
+                        "bytes": None,
+                    },
+                    block_manager=self,
+                )
+            except Exception:
+                pass
+            if k_remaining == 0:
+                break
 
-        return physical_block_id_mapping
+        add_swap_in(len(physical_block_id_mapping), None)
+
+        return physical_block_id_mapping, total_done
 
     def can_swap_out(self, seq_group: SequenceGroup) -> bool:
         """Returns whether we can swap out the given sequence_group 
@@ -445,11 +665,56 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
                 for gpu_block_id, cpu_block_id in seq_swap_mapping.items()
             }
 
-            # Cycle-level observability counters: updated at swap execution
-            # point to avoid missing internal swap paths.
-            add_swap_out(len(seq_physical_block_id_mapping))
             physical_block_id_mapping.extend(
                 list(seq_physical_block_id_mapping.items()))
+            try:
+                seq.recovery_obs.swapout_blocks_total += len(seq_swap_mapping)
+            except Exception:
+                pass
+            try:
+                seq.ensure_recovery_blocks()
+                seq.recovery_state.recovery_enabled = True
+                seq.recovery_state.mode = RecoveryMode.RECOVERY
+                seq.recovery_state.mark_all(RecoveryStorageHint.HOST_STORED)
+                seq.recovery_state.reset_restored_map(
+                    seq.recovery_state.num_blocks())
+                first_host = seq.recovery_state.first_host_block()
+                seq.recovery_state.swap_frontier = (first_host
+                                                    if first_host is not None
+                                                    else 0)
+                seq.recovery_state.swapout_blocks_total += len(seq_swap_mapping)
+                seq.recovery_state.note_progress()
+            except Exception:
+                pass
+            try:
+                log_recovery_event(
+                    "RECOVERY_HINT_SNAPSHOT",
+                    req_id=seq_group.request_id,
+                    seq_id=seq.seq_id,
+                    detail={
+                        "n_gpu": seq.recovery_state.count_hints()[0],
+                        "n_host": seq.recovery_state.count_hints()[1],
+                        "n_missing": seq.recovery_state.count_hints()[2],
+                    },
+                    block_manager=self,
+                )
+            except Exception:
+                pass
+            try:
+                log_recovery_event(
+                    "SWAP_OUT",
+                    req_id=seq_group.request_id,
+                    seq_id=seq.seq_id,
+                    detail={
+                        "blocks_count": len(seq_swap_mapping),
+                        "bytes": None,
+                    },
+                    block_manager=self,
+                )
+            except Exception:
+                pass
+
+        add_swap_out(len(physical_block_id_mapping), None)
 
         return physical_block_id_mapping
 

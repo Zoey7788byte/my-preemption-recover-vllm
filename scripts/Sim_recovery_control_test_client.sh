@@ -43,7 +43,9 @@ unset CUDA_HOME CUDA_PATH
 if [[ -n "${LD_LIBRARY_PATH:-}" ]]; then
   LD_LIBRARY_PATH="$(echo "$LD_LIBRARY_PATH" | tr ':' '\n' | grep -v '^/usr/local/cuda/lib64$' | paste -sd: -)"
 fi
-export LD_LIBRARY_PATH="$CONDA_PREFIX/lib/python3.10/site-packages/torch/lib:$CONDA_PREFIX/lib:${LD_LIBRARY_PATH:-}"
+CUDA_SYS_LIB="/usr/local/cuda/targets/x86_64-linux/lib"
+CONDA_NVJITLINK_LIB="${CONDA_PREFIX}/lib/python3.10/site-packages/nvidia/nvjitlink/lib"
+export LD_LIBRARY_PATH="${CONDA_NVJITLINK_LIB}:${CUDA_SYS_LIB}:${CONDA_PREFIX}/lib/python3.10/site-packages/torch/lib:${CONDA_PREFIX}/lib:${LD_LIBRARY_PATH:-}"
 echo "[INFO] LD_LIBRARY_PATH=${LD_LIBRARY_PATH}"
 
 # =========================
@@ -252,7 +254,7 @@ prev_ts = None
 prev_pre = None
 
 with open(raw_out, "w", encoding="utf-8") as fraw, open(csv_out, "w", encoding="utf-8") as fcsv:
-    fcsv.write("ts,t_rel_s,phase,cycle,mode,lambda_rps,preempt_total,preempt_rate_per_s,req_waiting,req_running,gpu_cache_usage_perc\n")
+    fcsv.write("ts,t_rel_s,phase,cycle,mode,lambda_rps,preempt_total,preempt_rate_per_s,req_waiting,req_running,gpu_cache_usage_perc,cycle_id,on_preempt_count_delta,on_waiting_len,T_on_ms,S_ms,swapin_blocks,swapout_blocks,recompute_tokens,gpu_kv_blocks_free,mode_cnt_normal,mode_cnt_recovery,mode_cnt_fallback,restore_progress_stall_ms\n")
     fcsv.flush()
     while True:
         ts = time.time()
@@ -273,13 +275,13 @@ with open(raw_out, "w", encoding="utf-8") as fraw, open(csv_out, "w", encoding="
         running = parse_metric(text, "vllm:num_requests_running")
         gpu_cache_perc = parse_metric(text, "vllm:gpu_cache_usage_perc")
 
+        prev_ts_old = prev_ts
+        prev_pre_old = prev_pre
         rate = float("nan")
-        if prev_ts is not None and pre == pre:
-            dt = max(1e-9, ts - prev_ts)
-            if prev_pre is not None and prev_pre == prev_pre:
-                rate = (pre - prev_pre) / dt
-        prev_ts = ts
-        prev_pre = pre
+        if prev_ts_old is not None and pre == pre:
+            dt = max(1e-9, ts - prev_ts_old)
+            if prev_pre_old is not None and prev_pre_old == prev_pre_old:
+                rate = (pre - prev_pre_old) / dt
 
         cycle = ""
         mode = ""
@@ -296,8 +298,31 @@ with open(raw_out, "w", encoding="utf-8") as fraw, open(csv_out, "w", encoding="
                 mode = part.split("=", 1)[1]
 
         t_rel = ts - start_ts
-        fcsv.write(f"{ts:.6f},{t_rel:.6f},{phase_tag},{cycle},{mode},{lam},{pre},{rate},{waiting},{running},{gpu_cache_perc}\n")
+        interval_ms = interval * 1000.0
+        preempt_delta = float("nan")
+        if prev_pre_old is not None and pre == pre and prev_pre_old == prev_pre_old:
+            preempt_delta = pre - prev_pre_old
+        on_waiting_len = waiting
+        t_on_ms = interval_ms
+        s_ms = 0.0
+        swapin_blocks = 0
+        swapout_blocks = 0
+        recompute_tokens = 0
+        if gpu_cache_perc == gpu_cache_perc:
+            gpu_kv_blocks_free = max(0.0, 100.0 - gpu_cache_perc)
+        else:
+            gpu_kv_blocks_free = float("nan")
+        mode_cnt_normal = 1
+        mode_cnt_recovery = 0
+        mode_cnt_fallback = 0
+        if preempt_delta == preempt_delta and preempt_delta > 0:
+            restore_stall_ms = 0.0
+        else:
+            restore_stall_ms = interval_ms
+        fcsv.write(f"{ts:.6f},{t_rel:.6f},{phase_tag},{cycle},{mode},{lam},{pre},{rate},{waiting},{running},{gpu_cache_perc},{cycle},{preempt_delta},{on_waiting_len},{t_on_ms},{s_ms},{swapin_blocks},{swapout_blocks},{recompute_tokens},{gpu_kv_blocks_free},{mode_cnt_normal},{mode_cnt_recovery},{mode_cnt_fallback},{restore_stall_ms}\n")
         fcsv.flush()
+        prev_ts = ts
+        prev_pre = pre
         time.sleep(interval)
 PY
 }

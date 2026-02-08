@@ -13,8 +13,10 @@ from vllm.core.interfaces import AllocStatus, BlockSpaceManager
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
 from vllm.prompt_adapter.request import PromptAdapterRequest
-from vllm.recovery import RecoveryObservability
-from vllm.sequence import (Sequence, SequenceData, SequenceGroup,
+from vllm.recovery.observability import (RecoveryObservability,
+                                         get_recovery_config,
+                                         log_recovery_event)
+from vllm.sequence import (RecoveryMode, Sequence, SequenceData, SequenceGroup,
                            SequenceGroupMetadata, SequenceGroupMetadataDelta,
                            SequenceStatus)
 from vllm.utils import Device, PyObjectCache
@@ -27,6 +29,7 @@ ENABLE_ARTIFICIAL_PREEMPT = bool(
     os.getenv("VLLM_TEST_ENABLE_ARTIFICIAL_PREEMPT", False))  # noqa
 ARTIFICIAL_PREEMPTION_PROB = 0.5
 ARTIFICIAL_PREEMPTION_MAX_CNT = 500
+RECOVERY_RECOMPUTE_DELTA_TOKENS = 128
 
 
 class PreemptionMode(enum.Enum):
@@ -391,6 +394,9 @@ class Scheduler:
                                        if self.enable_artificial_preemption
                                        else 0)
         self.num_cumulative_preemption: int = 0
+        self._recovery_obs = RecoveryObservability()
+        self._recovery_stall_logged_ns: Dict[int, int] = {}
+        self._recovery_cfg = get_recovery_config()
 
         # Used to cache python objects
         self._seq_group_metadata_cache: List[PyObjectCache] = []
@@ -419,7 +425,6 @@ class Scheduler:
         # will be stopped during schedule() call and added to this stop list
         # for processing and deallocation by the free_finished_seq_groups()
         self._async_stopped: List[SequenceGroup] = []
-        self._recovery_obs = RecoveryObservability()
 
     @property
     def next_cache_id(self):
@@ -640,7 +645,7 @@ class Scheduler:
                     preempted_mode = self._preempt(
                         victim_seq_group,
                         blocks_to_swap_out,
-                        reason="low_free_blocks",
+                        reason="no_append_slots",
                     )
                     if preempted_mode == PreemptionMode.RECOMPUTE:
                         preempted.append(victim_seq_group)
@@ -715,6 +720,9 @@ class Scheduler:
         infeasible_seq_groups: List[SequenceGroup] = []
 
         swapped_queue = self.swapped
+        k_swap_max = self._recovery_cfg.budget
+        if k_swap_max <= 0:
+            k_swap_max = 1
 
         leftover_swapped: Deque[SequenceGroup] = deque()
         while swapped_queue:
@@ -724,7 +732,8 @@ class Scheduler:
             is_prefill = seq_group.is_prefill()
             alloc_status = self.block_manager.can_swap_in(
                 seq_group,
-                self._get_num_lookahead_slots(is_prefill, enable_chunking))
+                self._get_num_lookahead_slots(is_prefill, enable_chunking),
+                k_swap_max=k_swap_max)
             if alloc_status == AllocStatus.LATER:
                 break
             elif alloc_status == AllocStatus.NEVER:
@@ -751,6 +760,16 @@ class Scheduler:
                     swapped_queue.popleft()
                     continue
 
+            k_done, fully_restored = self._swap_in(seq_group,
+                                                   blocks_to_swap_in,
+                                                   k_swap_max)
+            if not fully_restored:
+                if k_done == 0:
+                    break
+                swapped_queue.popleft()
+                leftover_swapped.appendleft(seq_group)
+                continue
+
             # The total number of sequences in the RUNNING state should not
             # exceed the maximum number of sequences.
             num_new_seqs = seq_group.get_max_num_running_seqs()
@@ -763,12 +782,15 @@ class Scheduler:
                     num_new_tokens=num_new_tokens_uncached,
                     num_new_seqs=num_new_seqs,
             ):
-                break
+                swapped_queue.popleft()
+                leftover_swapped.appendleft(seq_group)
+                continue
 
             if lora_int_id > 0 and curr_loras is not None:
                 curr_loras.add(lora_int_id)
             swapped_queue.popleft()
-            self._swap_in(seq_group, blocks_to_swap_in)
+            for seq in seq_group.get_seqs(status=SequenceStatus.SWAPPED):
+                seq.status = SequenceStatus.RUNNING
             self._append_slots(seq_group, blocks_to_copy, enable_chunking)
             is_prefill = seq_group.is_prefill()
             if is_prefill:
@@ -880,9 +902,11 @@ class Scheduler:
                                          num_running_seqs)
 
                 #Preempt out the victim sequence group
-                self._preempt(vseq_group,
-                              blocks_to_swap_out,
-                              reason="priority_inversion")
+                self._preempt(
+                    vseq_group,
+                    blocks_to_swap_out,
+                    reason="priority_preemption",
+                )
                 waiting_queue.appendleft(vseq_group)
                 force_preemption_count += 1
             #Put the sequence back into the waiting queue
@@ -936,18 +960,26 @@ class Scheduler:
             assert len(waiting_seqs) == 1, (
                 "Waiting sequence group should have only one prompt "
                 "sequence.")
+            recompute_needed = (
+                waiting_seqs[0].recovery_state.recovery_enabled and
+                waiting_seqs[0].recovery_state.has_missing_recompute() and
+                (not waiting_seqs[0].recovery_state.has_host_stored()))
             num_new_tokens_uncached, num_new_tokens_cached = (
                 self._get_num_new_uncached_and_cached_tokens(
                     seq_group, SequenceStatus.WAITING, enable_chunking,
                     budget))
             num_new_tokens = num_new_tokens_uncached + num_new_tokens_cached
+            if recompute_needed:
+                num_new_tokens_uncached = min(num_new_tokens_uncached,
+                                              RECOVERY_RECOMPUTE_DELTA_TOKENS)
+                num_new_tokens = num_new_tokens_uncached + num_new_tokens_cached
 
-            if not enable_chunking:
+            if not enable_chunking and not recompute_needed:
                 num_prompt_tokens = waiting_seqs[0].get_len()
                 assert num_new_tokens == num_prompt_tokens
 
             prompt_limit = self._get_prompt_limit(seq_group)
-            if num_new_tokens > prompt_limit:
+            if (not recompute_needed) and num_new_tokens > prompt_limit:
                 logger.warning(
                     "Input prompt (%d tokens) is too long"
                     " and exceeds limit of %d", num_new_tokens, prompt_limit)
@@ -1294,7 +1326,9 @@ class Scheduler:
         # Schedule sequence groups.
         # This function call changes the internal states of the scheduler
         # such as self.running, self.swapped, and self.waiting.
-        self._recovery_obs.on_cycle_begin(time.time())
+        cycle_start_wall = time.time()
+        self._recovery_obs.on_cycle_begin(cycle_start_wall)
+        self._run_recovery_micro_tasks()
         scheduler_start_time = time.perf_counter()
 
         scheduler_outputs: SchedulerOutputs = self._schedule()
@@ -1417,6 +1451,55 @@ class Scheduler:
                 allow_async_output_proc = self._allow_async_output_proc(
                     seq_group)
 
+            if is_prompt:
+                for seq in seq_group.get_seqs():
+                    if not (seq.recovery_state.recovery_enabled
+                            and seq.recovery_state.has_missing_recompute()
+                            and (not seq.recovery_state.has_host_stored())):
+                        continue
+                    before, after, delta_done = seq.recovery_state.recompute_step(
+                        token_chunk_size,
+                        seq.block_size,
+                        seq.get_len(),
+                    )
+                    try:
+                        log_recovery_event(
+                            "RECOMPUTE_MICRO",
+                            req_id=seq_group.request_id,
+                            seq_id=seq.seq_id,
+                            detail={
+                                "delta_req": token_chunk_size,
+                                "delta_done": delta_done,
+                                "rec_frontier_before": before,
+                                "rec_frontier_after": after,
+                            },
+                            block_manager=self.block_manager,
+                        )
+                    except Exception:
+                        pass
+                    try:
+                        start_block = before // seq.block_size
+                        end_block = (after - 1) // seq.block_size if after > 0 else start_block
+                        commit_start, commit_end, new_frontier = (
+                            seq.recovery_state.commit_progress(
+                                "recompute",
+                                start_block,
+                                end_block + 1,
+                            ))
+                        log_recovery_event(
+                            "RECOVERY_PROGRESS_COMMIT",
+                            req_id=seq_group.request_id,
+                            seq_id=seq.seq_id,
+                            detail={
+                                "kind": "recompute",
+                                "range": [commit_start, commit_end],
+                                "new_frontier": new_frontier,
+                            },
+                            block_manager=self.block_manager,
+                        )
+                    except Exception:
+                        pass
+
         # Now that the batch has been created, we can assume all blocks in the
         # batch will have been computed before the next scheduling invocation.
         # This is because the engine assumes that a failure in model execution
@@ -1439,20 +1522,95 @@ class Scheduler:
                 else:
                     seq_group.metrics.scheduler_time = scheduler_time
 
-        self._recovery_obs.on_cycle_end(
-            now_s=time.time(),
-            cycle_context=self._build_recovery_cycle_context(
-                scheduler_outputs=scheduler_outputs,
-                scheduler_wall_s=scheduler_time,
-            ),
-        )
-
         # Move to next cache (if exists)
         self.cache_id = self.next_cache_id
+
+        # Observability: cycle boundary summary (Phase0)
+        cycle_end_wall = time.time()
+        try:
+            num_scheduled = len(scheduler_outputs.scheduled_seq_groups)
+            num_prefill = scheduler_outputs.num_prefill_groups
+            num_decode = max(0, num_scheduled - num_prefill)
+            prefill_tokens = 0
+            decode_tokens = 0
+            for scheduled in scheduler_outputs.scheduled_seq_groups:
+                if scheduled.seq_group.is_prefill():
+                    prefill_tokens += scheduled.token_chunk_size
+                else:
+                    decode_tokens += scheduled.token_chunk_size
+            swap_frontier_sum = 0
+            swap_frontier_count = 0
+            for seq_group in list(self.waiting) + list(self.running) + list(
+                    self.swapped):
+                for seq in seq_group.seqs:
+                    if not seq.recovery_state.recovery_enabled:
+                        continue
+                    swap_frontier_sum += seq.recovery_state.swap_frontier
+                    swap_frontier_count += 1
+            swap_frontier_avg = None
+            if swap_frontier_count > 0:
+                swap_frontier_avg = (swap_frontier_sum /
+                                     swap_frontier_count)
+            cycle_ctx = {
+                "prefill_groups": num_prefill,
+                "decode_groups": num_decode,
+                "prefill_tokens": prefill_tokens,
+                "decode_tokens": decode_tokens,
+                "cycle_wall_ms": max(0.0, (cycle_end_wall - cycle_start_wall) * 1000.0),
+                "num_batched_tokens": scheduler_outputs.num_batched_tokens,
+                "running_queue_size": scheduler_outputs.running_queue_size,
+                "waiting_len": len(self.waiting),
+                "running_len": len(self.running),
+                "swapped_len": len(self.swapped),
+                "preempted": scheduler_outputs.preempted,
+            }
+            if swap_frontier_avg is not None:
+                cycle_ctx["swap_frontier_avg"] = swap_frontier_avg
+            self._recovery_obs.on_cycle_end(cycle_end_wall, cycle_ctx)
+        except Exception:
+            self._recovery_obs.on_cycle_end(cycle_end_wall, None)
+
+        # Recovery stalled detection (Phase1 diagnostic only).
+        try:
+            now_ns = time.time_ns()
+            stall_threshold_ns = 10_000_000_000
+            for seq_group in list(self.waiting) + list(self.running) + list(
+                    self.swapped):
+                for seq in seq_group.seqs:
+                    if not seq.recovery_state.recovery_enabled:
+                        continue
+                    last_progress = seq.recovery_state.last_progress_ts_ns
+                    if last_progress == 0:
+                        continue
+                    if now_ns - last_progress < stall_threshold_ns:
+                        continue
+                    last_logged = self._recovery_stall_logged_ns.get(
+                        seq.seq_id, 0)
+                    if now_ns - last_logged < stall_threshold_ns:
+                        continue
+                    self._recovery_stall_logged_ns[seq.seq_id] = now_ns
+                    log_recovery_event(
+                        "RECOVERY_STALLED",
+                        req_id=seq_group.request_id,
+                        seq_id=seq.seq_id,
+                        detail={
+                            "stall_ms": max(
+                                0.0, (now_ns - last_progress) / 1e6),
+                        },
+                    )
+        except Exception:
+            pass
 
         # Return results
         return (seq_group_metadata_list, scheduler_outputs,
                 allow_async_output_proc)
+
+    def _run_recovery_micro_tasks(self) -> None:
+        """Select and execute small recovery tasks per cycle.
+
+        Phase1: placeholder hook for future swap/recompute planning.
+        """
+        return
 
     def fork_seq(self, parent_seq: Sequence, child_seq: Sequence) -> None:
         self.block_manager.fork(parent_seq, child_seq)
@@ -1547,7 +1705,7 @@ class Scheduler:
         self,
         seq_group: SequenceGroup,
         blocks_to_swap_out: List[Tuple[int, int]],
-        reason: str = "low_free_blocks",
+        reason: Optional[str] = None,
     ) -> PreemptionMode:
         # If preemption mode is not specified, we determine the mode as follows:
         # We use recomputation by default since it incurs lower overhead than
@@ -1579,26 +1737,50 @@ class Scheduler:
                 "tensor_parallel_size to provide more KV cache memory. "
                 "total_num_cumulative_preemption=%d", seq_group.request_id,
                 preemption_mode, self.num_cumulative_preemption + 1)
+        try:
+            seq_id = None
+            if seq_group.seqs:
+                seq_id = seq_group.seqs[0].seq_id
+            log_recovery_event(
+                "PREEMPT_TRIGGERED",
+                req_id=seq_group.request_id,
+                seq_id=seq_id,
+                reason=reason or "no_kv_space",
+                detail={"preemption_mode": preemption_mode.name},
+                block_manager=self.block_manager,
+            )
+        except Exception:
+            pass
+        try:
+            for seq in seq_group.seqs:
+                seq.ensure_recovery_blocks()
+                seq.recovery_state.recovery_enabled = True
+                seq.recovery_state.mode = RecoveryMode.RECOVERY
+                seq.recovery_state.num_recovery_attempts += 1
+                seq.recovery_state.swap_frontier = 0
+                seq.recovery_state.rec_frontier = 0
+                seq.recovery_state.reset_restored_map(
+                    seq.recovery_state.num_blocks())
+                seq.recovery_state.note_progress()
+                log_recovery_event(
+                    "RECOVERY_STATE_CREATED",
+                    req_id=seq_group.request_id,
+                    seq_id=seq.seq_id,
+                    detail={
+                        "swap_frontier": seq.recovery_state.swap_frontier,
+                        "rec_frontier": seq.recovery_state.rec_frontier,
+                        "num_blocks": seq.recovery_state.num_blocks(),
+                    },
+                    block_manager=self.block_manager,
+                )
+        except Exception:
+            pass
+        try:
+            for seq in seq_group.seqs:
+                seq.recovery_obs.preempt_cnt += 1
+        except Exception:
+            pass
         self.num_cumulative_preemption += 1
-        recovery_obs_state = getattr(seq_group, "recovery_obs", None)
-        if recovery_obs_state is not None:
-            recovery_obs_state.preempt_cnt += 1
-
-        self._recovery_obs.log_request_event(
-            "PREEMPT_TRIGGERED",
-            req_id=seq_group.request_id,
-            seq_id=(seq_group.get_seqs()[0].seq_id
-                    if len(seq_group.get_seqs()) > 0 else None),
-            reason=reason,
-            detail={
-                "preemption_mode": preemption_mode.name.lower(),
-                "queue_waiting_len": len(self.waiting),
-                "queue_running_len": len(self.running),
-                "queue_swapped_len": len(self.swapped),
-                "num_cumulative_preemption": self.num_cumulative_preemption,
-            },
-            block_manager=self.block_manager,
-        )
 
         if preemption_mode == PreemptionMode.RECOMPUTE:
             self._preempt_by_recompute(seq_group)
@@ -1606,6 +1788,23 @@ class Scheduler:
             self._preempt_by_swap(seq_group, blocks_to_swap_out)
         else:
             raise AssertionError("Invalid preemption mode.")
+        try:
+            if preemption_mode == PreemptionMode.RECOMPUTE:
+                for seq in seq_group.seqs:
+                    n_gpu, n_host, n_missing = seq.recovery_state.count_hints()
+                    log_recovery_event(
+                        "RECOVERY_HINT_SNAPSHOT",
+                        req_id=seq_group.request_id,
+                        seq_id=seq.seq_id,
+                        detail={
+                            "n_gpu": n_gpu,
+                            "n_host": n_host,
+                            "n_missing": n_missing,
+                        },
+                        block_manager=self.block_manager,
+                    )
+        except Exception:
+            pass
         return preemption_mode
 
     def _preempt_by_recompute(
@@ -1630,32 +1829,16 @@ class Scheduler:
         self,
         seq_group: SequenceGroup,
         blocks_to_swap_in: List[Tuple[int, int]],
-    ) -> None:
-        mapping = self.block_manager.swap_in(seq_group) or []
-        seqs = seq_group.get_seqs(status=SequenceStatus.SWAPPED)
-        seq_ids = [seq.seq_id for seq in seqs]
-        recovery_obs_state = getattr(seq_group, "recovery_obs", None)
-        if recovery_obs_state is not None:
-            recovery_obs_state.swapin_blocks_total += len(mapping)
-        self._recovery_obs.log_request_event(
-            "SWAP_IN",
-            req_id=seq_group.request_id,
-            seq_id=(seq_ids[0] if seq_ids else None),
-            reason="resume",
-            detail={
-                "blocks": len(mapping),
-                # Phase0 placeholder: block bytes are not directly exposed
-                # in scheduler path.
-                "bytes": 0,
-                "seq_ids": seq_ids,
-                "from": "cpu",
-                "to": "gpu",
-            },
-            block_manager=self.block_manager,
-        )
+        k_swap_max: int,
+    ) -> Tuple[int, bool]:
+        mapping, k_done = self.block_manager.swap_in(seq_group, k_swap_max)
         blocks_to_swap_in.extend(mapping)
+        fully_restored = True
         for seq in seq_group.get_seqs(status=SequenceStatus.SWAPPED):
-            seq.status = SequenceStatus.RUNNING
+            if seq.recovery_state.needs_recovery():
+                fully_restored = False
+                break
+        return k_done, fully_restored
 
     def _swap_out(
         self,
@@ -1668,99 +1851,10 @@ class Scheduler:
             raise RuntimeError(
                 "Aborted due to the lack of CPU swap space. Please increase "
                 "the swap space to avoid this error.")
-        mapping = self.block_manager.swap_out(seq_group) or []
-        seqs = seq_group.get_seqs(status=SequenceStatus.RUNNING)
-        seq_ids = [seq.seq_id for seq in seqs]
-        recovery_obs_state = getattr(seq_group, "recovery_obs", None)
-        if recovery_obs_state is not None:
-            recovery_obs_state.swapout_blocks_total += len(mapping)
-        self._recovery_obs.log_request_event(
-            "SWAP_OUT",
-            req_id=seq_group.request_id,
-            seq_id=(seq_ids[0] if seq_ids else None),
-            reason="low_free_blocks",
-            detail={
-                "blocks": len(mapping),
-                # Phase0 placeholder: block bytes are not directly exposed
-                # in scheduler path.
-                "bytes": 0,
-                "seq_ids": seq_ids,
-                "from": "gpu",
-                "to": "cpu",
-            },
-            block_manager=self.block_manager,
-        )
+        mapping = self.block_manager.swap_out(seq_group)
         blocks_to_swap_out.extend(mapping)
         for seq in seq_group.get_seqs(status=SequenceStatus.RUNNING):
             seq.status = SequenceStatus.SWAPPED
-
-    def _estimate_swap_frontier_avg(self) -> float:
-        if not self.swapped:
-            return 0.0
-        frontiers: List[int] = []
-        for seq_group in self.swapped:
-            seqs = seq_group.get_seqs(status=SequenceStatus.SWAPPED)
-            if not seqs:
-                seqs = seq_group.get_seqs()
-            for seq in seqs:
-                frontiers.append(seq.data.get_num_computed_tokens())
-        if not frontiers:
-            return 0.0
-        return round(sum(frontiers) / len(frontiers), 3)
-
-    def _build_recovery_cycle_context(
-        self,
-        *,
-        scheduler_outputs: SchedulerOutputs,
-        scheduler_wall_s: float,
-    ) -> Dict[str, Union[int, float]]:
-        prefill_tokens = 0
-        decode_tokens = 0
-        for scheduled in scheduler_outputs.scheduled_seq_groups:
-            if scheduled.seq_group.is_prefill():
-                prefill_tokens += scheduled.token_chunk_size
-            else:
-                decode_tokens += scheduled.token_chunk_size
-
-        token_budget = max(1, self.scheduler_config.max_num_batched_tokens)
-        seq_budget = max(1, self.scheduler_config.max_num_seqs)
-        online_load_tokens = min(1.0, scheduler_outputs.num_batched_tokens /
-                                 token_budget)
-        online_load_seqs = min(1.0, scheduler_outputs.running_queue_size /
-                               seq_budget)
-        online_load_est = max(online_load_tokens, online_load_seqs)
-        gpu_kv_blocks_free = 0
-        try:
-            gpu_kv_blocks_free = int(self.block_manager.get_num_free_gpu_blocks())
-        except Exception:
-            gpu_kv_blocks_free = 0
-        t_on_ms = round(max(0.0, scheduler_wall_s) * 1000.0, 3)
-
-        return {
-            "cycle_wall_ms": t_on_ms,
-            "prefill_tokens": prefill_tokens,
-            "decode_tokens": decode_tokens,
-            "num_batched_tokens": scheduler_outputs.num_batched_tokens,
-            "running_queue_size": scheduler_outputs.running_queue_size,
-            "waiting_len": len(self.waiting),
-            "on_waiting_len": len(self.waiting),
-            "running_len": len(self.running),
-            "swapped_len": len(self.swapped),
-            "preempted": scheduler_outputs.preempted,
-            "on_preempt_count_delta": scheduler_outputs.preempted,
-            "swap_frontier_avg": self._estimate_swap_frontier_avg(),
-            "T_on_ms": t_on_ms,
-            "recovery_overhead_ms": 0.0,
-            "recompute_tokens": 0,
-            "gpu_kv_blocks_free": gpu_kv_blocks_free,
-            "online_load_est": round(online_load_est, 6),
-            "online_load_tokens": round(online_load_tokens, 6),
-            "online_load_seqs": round(online_load_seqs, 6),
-            "slack_tokens": max(0,
-                                token_budget - scheduler_outputs.num_batched_tokens),
-            "slack_seqs": max(
-                0, seq_budget - scheduler_outputs.running_queue_size),
-        }
 
     def _passed_delay(self, now: float) -> bool:
         if self.prev_prompt:
